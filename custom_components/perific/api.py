@@ -1,329 +1,190 @@
-"""API client for Perific/Enegic energy meters (Corrected)."""
+"""API client for Perific/Enegic."""
 
 from __future__ import annotations
 
 import logging
-import ssl
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import aiohttp
-import certifi
-from aiohttp import ClientError, ClientSession
-
-from .const import (
-    API_ACCOUNT_OVERVIEW,
-    API_BASE_URL,
-    API_IS_ACTIVATED,
-    API_ITEM_PARAMETERS,
-    API_LATEST_PACKETS,
-    API_PHASE_DATA,
-    API_REFRESH_TOKEN,
-    API_REPORTER_SETTINGS,
-    API_USER_INFO,
-)
 
 _LOGGER = logging.getLogger(__name__)
 
-
-class PerificAuthError(Exception):
-    """Authentication error."""
-
-
-class PerificAPIError(Exception):
-    """API error."""
+API_BASE = "https://api.enegic.com"
+API_ACCOUNT_OVERVIEW = f"{API_BASE}/getaccountoverview"
+API_LATEST_PACKETS = f"{API_BASE}/getlatestpackets"
+API_REFRESH_TOKEN = f"{API_BASE}/refreshtoken"
 
 
-class PerificAPI:
+class PerificApiClient:
     """API client for Perific/Enegic."""
 
-    def __init__(
-        self,
-        username: str,
-        token: str | None = None,
-        session: ClientSession | None = None,
-    ) -> None:
-        """Initialize the API client."""
-        self._username = username
+    def __init__(self, session: aiohttp.ClientSession, token: str) -> None:
+        """Initialize."""
+        self._session = session
         self._token = token
 
-        # Create SSL context with proper certificates
-        if session is None:
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
-            self._session = ClientSession(connector=connector)
-            self._session_owner = True  # We created the session
-        else:
-            self._session = session
-            self._session_owner = False  # Session provided by Home Assistant
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> Any:
+        """Make API request."""
+        headers = {
+            "Accept": "application/json",
+            "X-Authorization": self._token,
+        }
 
-        self._token_expires: datetime | None = None
-        self._user_id: int | None = None
-        self._items: list[dict[str, Any]] = []
+        if json is not None:
+            headers["Content-Type"] = "application/json"
 
-    async def check_activation(self) -> bool:
-        """Check if user is activated."""
-        data = {"username": self._username}
+        async with self._session.request(
+            method,
+            url,
+            headers=headers,
+            json=json,
+        ) as response:
+            text = await response.text()
 
-        try:
-            async with self._session.put(
-                f"{API_BASE_URL}{API_IS_ACTIVATED}",
-                json=data,
-                headers={"Content-Type": "application/json"},
-            ) as response:
-                response.raise_for_status()
-                result = await response.json()
-                return result.get("UserIsActivated", False)
-        except ClientError as err:
-            raise PerificAuthError(f"Activation check failed: {err}") from err
+            _LOGGER.debug(
+                "Perific API %s %s -> %s, body=%s, response=%s",
+                method,
+                url,
+                response.status,
+                json,
+                text[:2000],
+            )
 
-    async def refresh_token(self) -> None:
-        """Refresh the access token."""
-        if not self._token:
-            raise PerificAuthError("No token to refresh")
+            if response.status != 200:
+                raise Exception(f"API request failed: {response.status} - {text}")
 
-        data = {"token": self._token}
+            if not text.strip():
+                return []
 
-        try:
-            async with self._session.put(
-                f"{API_BASE_URL}{API_REFRESH_TOKEN}",
-                json=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Authorization": self._token,
-                },
-            ) as response:
-                response.raise_for_status()
-                result = await response.json()
+            try:
+                return await response.json()
+            except Exception as err:
+                raise Exception(f"Failed to decode JSON: {text}") from err
 
-                token_info = result.get("TokenInfo", {})
-                self._token = token_info.get("Token")
-
-                # Parse expiration
-                valid_to = token_info.get("ValidTo")
-                if valid_to:
-                    self._token_expires = datetime.fromisoformat(
-                        valid_to.replace("Z", "+00:00")
-                    )
-
-                # Store user ID
-                user_info = result.get("User", {})
-                self._user_id = user_info.get("UserId")
-
-        except ClientError as err:
-            raise PerificAuthError(f"Token refresh failed: {err}") from err
-
-    async def _ensure_authenticated(self) -> None:
-        """Ensure we have a valid token."""
-        if not self._token:
-            raise PerificAuthError("No token available")
-
-        # Check if token is expired (with 5 minute buffer)
-        if self._token_expires and datetime.now(self._token_expires.tzinfo) >= (
-            self._token_expires - timedelta(minutes=5)
-        ):
-            await self.refresh_token()
-
-    async def _request(self, method: str, endpoint: str, **kwargs) -> dict[str, Any]:
-        """Make an authenticated request."""
-        await self._ensure_authenticated()
-
-        headers = kwargs.pop("headers", {})
-        headers.update(
-            {
-                "X-Authorization": self._token,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
+    async def get_account_overview(self) -> list[dict[str, Any]]:
+        """Get account overview."""
+        return await self._request(
+            "GET",
+            API_ACCOUNT_OVERVIEW,
+            json={"IncludeSharedItems": True},
         )
 
-        url = f"{API_BASE_URL}{endpoint}"
-
-        try:
-            async with self._session.request(
-                method, url, headers=headers, **kwargs
-            ) as response:
-                response.raise_for_status()
-                return await response.json()
-        except ClientError as err:
-            raise PerificAPIError(f"API request failed: {err}") from err
-
-    async def get_user_info(self) -> dict[str, Any]:
-        """Get user information."""
-        return await self._request("GET", API_USER_INFO)
-
-    async def get_account_overview(self) -> dict[str, Any]:
-        """Get account overview including items."""
-        data = {"IncludeSharedItems": True}
-        return await self._request("POST", API_ACCOUNT_OVERVIEW, json=data)
-
     async def get_latest_packets(self) -> list[dict[str, Any]]:
-        """Get latest meter readings."""
-        return await self._request("PUT", API_LATEST_PACKETS)
+        """Get latest packets.
 
-    async def get_phase_data(
-        self,
-        item_id: int,
-        from_date: datetime,
-        to_date: datetime,
-        data_type: str = "Avg",
-    ) -> list[dict[str, Any]]:
-        """Get phase data for time range."""
-        # This endpoint uses form data
-        form_data = aiohttp.FormData()
-        form_data.add_field("itemId", str(item_id))
-        form_data.add_field("fromDate", from_date.isoformat())
-        form_data.add_field("toDate", to_date.isoformat())
-        form_data.add_field("dataType", data_type)
+        Note: despite the published docs showing no request body for this
+        endpoint, some accounts appear to return data only when the same
+        IncludeSharedItems payload used by the frontend is sent.
+        """
+        return await self._request(
+            "PUT",
+            API_LATEST_PACKETS,
+            json={"IncludeSharedItems": True},
+        )
 
-        headers = {"X-Authorization": self._token}
+    async def refresh_token(self) -> str:
+        """Refresh token."""
+        result = await self._request(
+            "PUT",
+            API_REFRESH_TOKEN,
+            json={"token": self._token},
+        )
 
-        url = f"{API_BASE_URL}{API_PHASE_DATA}"
+        token_info = result.get("TokenInfo", {})
+        new_token = token_info.get("Token") or result.get("token")
+        if new_token:
+            self._token = new_token
 
-        try:
-            async with self._session.post(
-                url, data=form_data, headers=headers
-            ) as response:
-                response.raise_for_status()
-                return await response.json()
-        except ClientError as err:
-            raise PerificAPIError(f"Phase data request failed: {err}") from err
-
-    async def get_item_parameters(self, item_id: int) -> dict[str, Any]:
-        """Get item parameters."""
-        data = {"itemId": item_id}
-        return await self._request("PUT", API_ITEM_PARAMETERS, json=data)
-
-    async def get_reporter_settings(self) -> dict[str, Any]:
-        """Get reporter settings (EV chargers, etc.)."""
-        return await self._request("POST", API_REPORTER_SETTINGS)
+        return self._token
 
     async def get_current_power(self, item_id: int) -> dict[str, Any]:
         """Get current power reading from latest packets."""
         packets = await self.get_latest_packets()
 
-        for packet in packets:
-            if packet.get("ItemId") == item_id:
-                latest_packets = packet.get("LatestPackets", {})
-
-                # Try to get the most recent data
-                for packet_type in ["PhaseRealTime", "PhaseMinute", "PhaseHour"]:
-                    if packet_type in latest_packets:
-                        phase_data = latest_packets[packet_type]
-                        data = phase_data.get("data", {})
-
-                        # Calculate total power from current and voltage
-                        hiavg = data.get("hiavg", [0, 0, 0])
-                        huavg = data.get("huavg", [230, 230, 230])
-
-                        # Calculate power per phase (P = U * I)
-                        power_phases = [
-                            abs(current) * voltage
-                            for current, voltage in zip(hiavg, huavg)
-                        ]
-                        total_power = sum(power_phases)
-
-                        return {
-                            "timestamp": datetime.fromtimestamp(
-                                phase_data.get("ts", 0) / 1000
-                            ).isoformat(),
-                            "power": {
-                                "total": total_power,
-                                "l1": power_phases[0],
-                                "l2": power_phases[1],
-                                "l3": power_phases[2],
-                            },
-                            "voltage": {
-                                "l1": huavg[0],
-                                "l2": huavg[1],
-                                "l3": huavg[2],
-                            },
-                            "current": {
-                                "l1": hiavg[0],
-                                "l2": hiavg[1],
-                                "l3": hiavg[2],
-                            },
-                            "imported_energy": data.get("hwi", 0),
-                            "exported_energy": data.get("hwo", 0),
-                            "firmware": phase_data.get("fw"),
-                            "signal_strength": phase_data.get("rssi"),
-                        }
-
-        return {}
-
-    async def get_energy_today(self, item_id: int) -> dict[str, Any]:
-        """Get today's energy consumption."""
-        packets = await self.get_latest_packets()
+        if not isinstance(packets, list):
+            _LOGGER.warning("Latest packets response is not a list: %s", packets)
+            return {}
 
         for packet in packets:
-            if packet.get("ItemId") == item_id:
-                latest_packets = packet.get("LatestPackets", {})
+            packet_item_id = (
+                packet.get("ItemId")
+                or packet.get("itemId")
+                or packet.get("iid")
+                or packet.get("item_id")
+            )
 
-                # Get day data if available
-                if "PhaseDay" in latest_packets:
-                    day_data = latest_packets["PhaseDay"].get("data", {})
+            if packet_item_id is None:
+                continue
 
-                    # Calculate energy from power data
-                    hwpi = day_data.get("hwpi", [0, 0, 0])
-                    hwpo = day_data.get("hwpo", [0, 0, 0])
+            if str(packet_item_id) != str(item_id):
+                continue
 
-                    imported_today = sum(hwpi)
-                    exported_today = sum(hwpo)
+            latest_packets = packet.get("LatestPackets", {}) or {}
 
-                    return {
-                        "imported": imported_today,
-                        "exported": exported_today,
-                        "net": imported_today - exported_today,
-                        "unit": "kWh",
-                    }
+            # Prefer real-time, then minute, then hour, then day
+            for packet_type in ("PhaseRealTime", "PhaseMinute", "PhaseHour", "PhaseDay"):
+                phase_packet = latest_packets.get(packet_type)
+                if not phase_packet:
+                    continue
 
-        return {"imported": 0, "exported": 0, "net": 0, "unit": "kWh"}
+                data = phase_packet.get("data", {}) or {}
 
-    async def discover_items(self) -> list[dict[str, Any]]:
-        """Discover available items/meters."""
-        packets = await self.get_latest_packets()
-        items = []
+                hiavg = data.get("hiavg")
+                huavg = data.get("huavg")
 
-        for packet in packets:
-            item_id = packet.get("ItemId")
-            if item_id:
-                # Get item parameters for more details
+                if not isinstance(hiavg, list) or len(hiavg) < 3:
+                    continue
+
+                if not isinstance(huavg, list) or len(huavg) < 3:
+                    huavg = [230.0, 230.0, 230.0]
+
                 try:
-                    params = await self.get_item_parameters(item_id)
-                    actual_params = params.get("ActualParameters", {})
+                    currents = [float(x) for x in hiavg[:3]]
+                    voltages = [float(x) for x in huavg[:3]]
+                except (TypeError, ValueError):
+                    continue
 
-                    items.append(
-                        {
-                            "id": item_id,
-                            "name": actual_params.get("Name", f"Item {item_id}"),
-                            "system_name": actual_params.get("SystemName", ""),
-                            "type": actual_params.get("ItemType", "Phase"),
-                            "subtype": actual_params.get("ItemSubType", ""),
-                            "category": actual_params.get("ItemCategory", ""),
-                            "mac": actual_params.get("Mac", ""),
-                            "timezone": actual_params.get("TimeZone", ""),
-                        }
-                    )
-                except Exception as e:
-                    _LOGGER.warning(f"Could not get parameters for item {item_id}: {e}")
-                    items.append(
-                        {
-                            "id": item_id,
-                            "name": f"Item {item_id}",
-                            "system_name": "",
-                            "type": "Phase",
-                            "subtype": "",
-                            "category": "",
-                            "mac": "",
-                            "timezone": "",
-                        }
-                    )
+                power_phases = [abs(i) * v for i, v in zip(currents, voltages)]
 
-        self._items = items
-        return items
+                ts = phase_packet.get("ts")
+                timestamp = None
+                if ts:
+                    try:
+                        timestamp = datetime.fromtimestamp(ts / 1000).isoformat()
+                    except Exception:
+                        timestamp = None
 
-    async def close(self) -> None:
-        """Close the session."""
-        # Only close the session if we created it
-        if self._session_owner:
-            await self._session.close()
+                return {
+                    "timestamp": timestamp,
+                    "power": {
+                        "total": sum(power_phases),
+                        "l1": power_phases[0],
+                        "l2": power_phases[1],
+                        "l3": power_phases[2],
+                    },
+                    "voltage": {
+                        "l1": voltages[0],
+                        "l2": voltages[1],
+                        "l3": voltages[2],
+                    },
+                    "current": {
+                        "l1": currents[0],
+                        "l2": currents[1],
+                        "l3": currents[2],
+                    },
+                    "imported_energy": data.get("hwi"),
+                    "exported_energy": data.get("hwo"),
+                    "firmware": phase_packet.get("fw"),
+                    "signal_strength": phase_packet.get("rssi"),
+                    "packet_type": packet_type,
+                }
+
+        _LOGGER.warning("No current data found for item_id=%s in packets=%s", item_id, packets)
+        return {}
