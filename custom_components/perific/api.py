@@ -1,75 +1,185 @@
-"""API client for Perific/Enegic."""
+"""API client for Perific/Enegic energy meters."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import ssl
+from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
+import certifi
+from aiohttp import ClientError, ClientSession
+
+from .const import (
+    API_ACCOUNT_OVERVIEW,
+    API_BASE_URL,
+    API_IS_ACTIVATED,
+    API_ITEM_PARAMETERS,
+    API_LATEST_PACKETS,
+    API_PHASE_DATA,
+    API_REFRESH_TOKEN,
+    API_REPORTER_SETTINGS,
+    API_USER_INFO,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-API_BASE = "https://api.enegic.com"
-API_ACCOUNT_OVERVIEW = f"{API_BASE}/getaccountoverview"
-API_LATEST_PACKETS = f"{API_BASE}/getlatestpackets"
-API_REFRESH_TOKEN = f"{API_BASE}/refreshtoken"
+
+class PerificAuthError(Exception):
+    """Authentication error."""
 
 
-class PerificApiClient:
+class PerificAPIError(Exception):
+    """API error."""
+
+
+class PerificAPI:
     """API client for Perific/Enegic."""
 
-    def __init__(self, session: aiohttp.ClientSession, token: str) -> None:
-        """Initialize."""
-        self._session = session
+    def __init__(
+        self,
+        username: str,
+        token: str | None = None,
+        session: ClientSession | None = None,
+    ) -> None:
+        """Initialize the API client."""
+        self._username = username
         self._token = token
+        self._token_expires: datetime | None = None
+        self._user_id: int | None = None
+        self._items: list[dict[str, Any]] = []
+
+        if session is None:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self._session = ClientSession(connector=connector)
+            self._session_owner = True
+        else:
+            self._session = session
+            self._session_owner = False
+
+    async def check_activation(self) -> bool:
+        """Check if user is activated."""
+        data = {"username": self._username}
+
+        try:
+            async with self._session.put(
+                f"{API_BASE_URL}{API_IS_ACTIVATED}",
+                json=data,
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+                return result.get("UserIsActivated", False)
+        except ClientError as err:
+            raise PerificAuthError(f"Activation check failed: {err}") from err
+
+    async def refresh_token(self) -> None:
+        """Refresh the access token."""
+        if not self._token:
+            raise PerificAuthError("No token to refresh")
+
+        data = {"token": self._token}
+
+        try:
+            async with self._session.put(
+                f"{API_BASE_URL}{API_REFRESH_TOKEN}",
+                json=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Authorization": self._token,
+                    "Accept": "application/json",
+                },
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+
+                token_info = result.get("TokenInfo", {})
+                new_token = token_info.get("Token") or result.get("token")
+                if new_token:
+                    self._token = new_token
+
+                valid_to = token_info.get("ValidTo")
+                if valid_to:
+                    self._token_expires = datetime.fromisoformat(
+                        valid_to.replace("Z", "+00:00")
+                    )
+
+                user_info = result.get("User", {})
+                self._user_id = user_info.get("UserId")
+        except ClientError as err:
+            raise PerificAuthError(f"Token refresh failed: {err}") from err
+
+    async def _ensure_authenticated(self) -> None:
+        """Ensure we have a valid token."""
+        if not self._token:
+            raise PerificAuthError("No token available")
+
+        if self._token_expires and datetime.now(self._token_expires.tzinfo) >= (
+            self._token_expires - timedelta(minutes=5)
+        ):
+            await self.refresh_token()
 
     async def _request(
         self,
         method: str,
-        url: str,
+        endpoint: str,
         *,
         json: dict[str, Any] | None = None,
+        data: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
-        """Make API request."""
-        headers = {
-            "Accept": "application/json",
+        """Make an authenticated request."""
+        await self._ensure_authenticated()
+
+        request_headers = {
             "X-Authorization": self._token,
+            "Accept": "application/json",
         }
+        if headers:
+            request_headers.update(headers)
 
         if json is not None:
-            headers["Content-Type"] = "application/json"
+            request_headers.setdefault("Content-Type", "application/json")
 
-        async with self._session.request(
-            method,
-            url,
-            headers=headers,
-            json=json,
-        ) as response:
-            text = await response.text()
+        url = f"{API_BASE_URL}{endpoint}"
 
-            _LOGGER.debug(
-                "Perific API %s %s -> %s, body=%s, response=%s",
+        try:
+            async with self._session.request(
                 method,
                 url,
-                response.status,
-                json,
-                text[:2000],
-            )
+                headers=request_headers,
+                json=json,
+                data=data,
+            ) as response:
+                text = await response.text()
 
-            if response.status != 200:
-                raise Exception(f"API request failed: {response.status} - {text}")
+                _LOGGER.debug(
+                    "Perific API %s %s -> %s, json=%s, response=%s",
+                    method,
+                    url,
+                    response.status,
+                    json,
+                    text[:2000],
+                )
 
-            if not text.strip():
-                return []
+                response.raise_for_status()
 
-            try:
+                if not text.strip():
+                    return []
+
                 return await response.json()
-            except Exception as err:
-                raise Exception(f"Failed to decode JSON: {text}") from err
+        except ClientError as err:
+            raise PerificAPIError(f"API request failed: {err}") from err
 
-    async def get_account_overview(self) -> list[dict[str, Any]]:
-        """Get account overview."""
+    async def get_user_info(self) -> dict[str, Any]:
+        """Get user information."""
+        result = await self._request("GET", API_USER_INFO)
+        return result if isinstance(result, dict) else {}
+
+    async def get_account_overview(self) -> dict[str, Any]:
+        """Get account overview including items."""
         return await self._request(
             "GET",
             API_ACCOUNT_OVERVIEW,
@@ -77,32 +187,52 @@ class PerificApiClient:
         )
 
     async def get_latest_packets(self) -> list[dict[str, Any]]:
-        """Get latest packets.
+        """Get latest meter readings.
 
-        Note: despite the published docs showing no request body for this
-        endpoint, some accounts appear to return data only when the same
-        IncludeSharedItems payload used by the frontend is sent.
+        Some accounts only return data when IncludeSharedItems is present.
         """
-        return await self._request(
+        result = await self._request(
             "PUT",
             API_LATEST_PACKETS,
             json={"IncludeSharedItems": True},
         )
+        return result if isinstance(result, list) else []
 
-    async def refresh_token(self) -> str:
-        """Refresh token."""
+    async def get_phase_data(
+        self,
+        item_id: int,
+        from_date: datetime,
+        to_date: datetime,
+        data_type: str = "Avg",
+    ) -> list[dict[str, Any]]:
+        """Get phase data for time range."""
+        form_data = aiohttp.FormData()
+        form_data.add_field("itemId", str(item_id))
+        form_data.add_field("fromDate", from_date.isoformat())
+        form_data.add_field("toDate", to_date.isoformat())
+        form_data.add_field("dataType", data_type)
+
+        result = await self._request(
+            "POST",
+            API_PHASE_DATA,
+            data=form_data,
+            headers={"X-Authorization": self._token},
+        )
+        return result if isinstance(result, list) else []
+
+    async def get_item_parameters(self, item_id: int) -> dict[str, Any]:
+        """Get item parameters."""
         result = await self._request(
             "PUT",
-            API_REFRESH_TOKEN,
-            json={"token": self._token},
+            API_ITEM_PARAMETERS,
+            json={"itemId": item_id},
         )
+        return result if isinstance(result, dict) else {}
 
-        token_info = result.get("TokenInfo", {})
-        new_token = token_info.get("Token") or result.get("token")
-        if new_token:
-            self._token = new_token
-
-        return self._token
+    async def get_reporter_settings(self) -> dict[str, Any]:
+        """Get reporter settings."""
+        result = await self._request("POST", API_REPORTER_SETTINGS)
+        return result if isinstance(result, dict) else {}
 
     async def get_current_power(self, item_id: int) -> dict[str, Any]:
         """Get current power reading from latest packets."""
@@ -120,15 +250,11 @@ class PerificApiClient:
                 or packet.get("item_id")
             )
 
-            if packet_item_id is None:
-                continue
-
-            if str(packet_item_id) != str(item_id):
+            if packet_item_id is None or str(packet_item_id) != str(item_id):
                 continue
 
             latest_packets = packet.get("LatestPackets", {}) or {}
 
-            # Prefer real-time, then minute, then hour, then day
             for packet_type in ("PhaseRealTime", "PhaseMinute", "PhaseHour", "PhaseDay"):
                 phase_packet = latest_packets.get(packet_type)
                 if not phase_packet:
@@ -136,7 +262,7 @@ class PerificApiClient:
 
                 data = phase_packet.get("data", {}) or {}
 
-                hiavg = data.get("hiavg")
+                hiavg = data.get("hiavg") or data.get("iavg")
                 huavg = data.get("huavg")
 
                 if not isinstance(hiavg, list) or len(hiavg) < 3:
@@ -158,7 +284,7 @@ class PerificApiClient:
                 if ts:
                     try:
                         timestamp = datetime.fromtimestamp(ts / 1000).isoformat()
-                    except Exception:
+                    except (TypeError, ValueError, OSError):
                         timestamp = None
 
                 return {
@@ -188,3 +314,95 @@ class PerificApiClient:
 
         _LOGGER.warning("No current data found for item_id=%s in packets=%s", item_id, packets)
         return {}
+
+    async def get_energy_today(self, item_id: int) -> dict[str, Any]:
+        """Get today's energy consumption."""
+        packets = await self.get_latest_packets()
+
+        for packet in packets:
+            packet_item_id = (
+                packet.get("ItemId")
+                or packet.get("itemId")
+                or packet.get("iid")
+                or packet.get("item_id")
+            )
+
+            if packet_item_id is None or str(packet_item_id) != str(item_id):
+                continue
+
+            latest_packets = packet.get("LatestPackets", {}) or {}
+            day_packet = latest_packets.get("PhaseDay")
+            if not day_packet:
+                break
+
+            day_data = day_packet.get("data", {}) or {}
+
+            hwpi = day_data.get("hwpi", [0, 0, 0])
+            hwpo = day_data.get("hwpo", [0, 0, 0])
+
+            imported_today = sum(float(x) for x in hwpi[:3]) if isinstance(hwpi, list) else 0.0
+            exported_today = sum(float(x) for x in hwpo[:3]) if isinstance(hwpo, list) else 0.0
+
+            return {
+                "imported": imported_today,
+                "exported": exported_today,
+                "net": imported_today - exported_today,
+                "unit": "kWh",
+            }
+
+        return {"imported": 0.0, "exported": 0.0, "net": 0.0, "unit": "kWh"}
+
+    async def discover_items(self) -> list[dict[str, Any]]:
+        """Discover available items/meters."""
+        packets = await self.get_latest_packets()
+        items: list[dict[str, Any]] = []
+
+        for packet in packets:
+            item_id = (
+                packet.get("ItemId")
+                or packet.get("itemId")
+                or packet.get("iid")
+                or packet.get("item_id")
+            )
+
+            if not item_id:
+                continue
+
+            try:
+                params = await self.get_item_parameters(int(item_id))
+                actual_params = params.get("ActualParameters", {})
+
+                items.append(
+                    {
+                        "id": int(item_id),
+                        "name": actual_params.get("Name", f"Item {item_id}"),
+                        "system_name": actual_params.get("SystemName", ""),
+                        "type": actual_params.get("ItemType", "Phase"),
+                        "subtype": actual_params.get("ItemSubType", ""),
+                        "category": actual_params.get("ItemCategory", ""),
+                        "mac": actual_params.get("Mac", ""),
+                        "timezone": actual_params.get("TimeZone", ""),
+                    }
+                )
+            except Exception as err:
+                _LOGGER.warning("Could not get parameters for item %s: %s", item_id, err)
+                items.append(
+                    {
+                        "id": int(item_id),
+                        "name": f"Item {item_id}",
+                        "system_name": "",
+                        "type": "Phase",
+                        "subtype": "",
+                        "category": "",
+                        "mac": "",
+                        "timezone": "",
+                    }
+                )
+
+        self._items = items
+        return items
+
+    async def close(self) -> None:
+        """Close the session."""
+        if self._session_owner:
+            await self._session.close()
