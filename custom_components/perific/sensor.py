@@ -55,11 +55,21 @@ async def async_setup_entry(
                 PerificCurrentSensor(coordinator, item_id, item_name, "l1"),
                 PerificCurrentSensor(coordinator, item_id, item_name, "l2"),
                 PerificCurrentSensor(coordinator, item_id, item_name, "l3"),
-                PerificEnergySensor(coordinator, item_id, item_name, "imported"),
-                PerificEnergySensor(coordinator, item_id, item_name, "exported"),
-                PerificEnergySensor(coordinator, item_id, item_name, "net"),
             ]
         )
+
+        energy_today = item_data.get("energy_today", {})
+        if any(
+            energy_today.get(key) is not None
+            for key in ("imported", "exported", "net")
+        ):
+            entities.extend(
+                [
+                    PerificEnergySensor(coordinator, item_id, item_name, "imported"),
+                    PerificEnergySensor(coordinator, item_id, item_name, "exported"),
+                    PerificEnergySensor(coordinator, item_id, item_name, "net"),
+                ]
+            )
 
     async_add_entities(entities)
 

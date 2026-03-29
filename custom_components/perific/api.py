@@ -315,42 +315,69 @@ class PerificAPI:
         _LOGGER.warning("No current data found for item_id=%s in packets=%s", item_id, packets)
         return {}
 
-    async def get_energy_today(self, item_id: int) -> dict[str, Any]:
-        """Get today's energy consumption."""
-        packets = await self.get_latest_packets()
+async def get_energy_today(self, item_id: int) -> dict[str, Any]:
+    """Get today's energy values."""
+    packets = await self.get_latest_packets()
 
-        for packet in packets:
-            packet_item_id = (
-                packet.get("ItemId")
-                or packet.get("itemId")
-                or packet.get("iid")
-                or packet.get("item_id")
-            )
+    for packet in packets:
+        packet_item_id = (
+            packet.get("ItemId")
+            or packet.get("itemId")
+            or packet.get("iid")
+            or packet.get("item_id")
+        )
 
-            if packet_item_id is None or str(packet_item_id) != str(item_id):
+        if packet_item_id is None or str(packet_item_id) != str(item_id):
+            continue
+
+        latest_packets = packet.get("LatestPackets", {}) or {}
+
+        for packet_type in ("PhaseDay", "PhaseHour"):
+            phase_packet = latest_packets.get(packet_type)
+            if not phase_packet:
                 continue
 
-            latest_packets = packet.get("LatestPackets", {}) or {}
-            day_packet = latest_packets.get("PhaseDay")
-            if not day_packet:
-                break
+            data = phase_packet.get("data", {}) or {}
 
-            day_data = day_packet.get("data", {}) or {}
+            hwpi = data.get("hwpi")
+            hwpo = data.get("hwpo")
+            hwi = data.get("hwi")
+            hwo = data.get("hwo")
 
-            hwpi = day_data.get("hwpi", [0, 0, 0])
-            hwpo = day_data.get("hwpo", [0, 0, 0])
+            if hwpi is None and hwpo is None and hwi is None and hwo is None:
+                continue
 
-            imported_today = sum(float(x) for x in hwpi[:3]) if isinstance(hwpi, list) else 0.0
-            exported_today = sum(float(x) for x in hwpo[:3]) if isinstance(hwpo, list) else 0.0
+            imported = 0.0
+            exported = 0.0
+
+            if isinstance(hwpi, list):
+                imported = sum(float(x) for x in hwpi[:3] if x is not None)
+            elif hwpi is not None:
+                imported = float(hwpi)
+            elif hwi is not None:
+                imported = float(hwi)
+
+            if isinstance(hwpo, list):
+                exported = sum(float(x) for x in hwpo[:3] if x is not None)
+            elif hwpo is not None:
+                exported = float(hwpo)
+            elif hwo is not None:
+                exported = float(hwo)
 
             return {
-                "imported": imported_today,
-                "exported": exported_today,
-                "net": imported_today - exported_today,
+                "imported": imported,
+                "exported": exported,
+                "net": imported - exported,
                 "unit": "kWh",
+                "packet_type": packet_type,
             }
 
-        return {"imported": 0.0, "exported": 0.0, "net": 0.0, "unit": "kWh"}
+    return {
+        "imported": None,
+        "exported": None,
+        "net": None,
+        "unit": "kWh",
+    }
 
     async def discover_items(self) -> list[dict[str, Any]]:
         """Discover available items/meters."""
