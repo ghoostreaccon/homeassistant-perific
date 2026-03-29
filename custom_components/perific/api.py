@@ -180,17 +180,15 @@ class PerificAPI:
 
     async def get_account_overview(self) -> dict[str, Any]:
         """Get account overview including items."""
-        return await self._request(
+        result = await self._request(
             "GET",
             API_ACCOUNT_OVERVIEW,
             json={"IncludeSharedItems": True},
         )
+        return result if isinstance(result, dict) else {}
 
     async def get_latest_packets(self) -> list[dict[str, Any]]:
-        """Get latest meter readings.
-
-        Some accounts only return data when IncludeSharedItems is present.
-        """
+        """Get latest meter readings."""
         result = await self._request(
             "PUT",
             API_LATEST_PACKETS,
@@ -216,7 +214,7 @@ class PerificAPI:
             "POST",
             API_PHASE_DATA,
             data=form_data,
-            headers={"X-Authorization": self._token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         return result if isinstance(result, list) else []
 
@@ -238,10 +236,6 @@ class PerificAPI:
         """Get current power reading from latest packets."""
         packets = await self.get_latest_packets()
 
-        if not isinstance(packets, list):
-            _LOGGER.warning("Latest packets response is not a list: %s", packets)
-            return {}
-
         for packet in packets:
             packet_item_id = (
                 packet.get("ItemId")
@@ -261,7 +255,6 @@ class PerificAPI:
                     continue
 
                 data = phase_packet.get("data", {}) or {}
-
                 hiavg = data.get("hiavg") or data.get("iavg")
                 huavg = data.get("huavg")
 
@@ -312,72 +305,71 @@ class PerificAPI:
                     "packet_type": packet_type,
                 }
 
-        _LOGGER.warning("No current data found for item_id=%s in packets=%s", item_id, packets)
         return {}
 
-async def get_energy_today(self, item_id: int) -> dict[str, Any]:
-    """Get today's energy values."""
-    packets = await self.get_latest_packets()
+    async def get_energy_today(self, item_id: int) -> dict[str, Any]:
+        """Get today's energy values."""
+        packets = await self.get_latest_packets()
 
-    for packet in packets:
-        packet_item_id = (
-            packet.get("ItemId")
-            or packet.get("itemId")
-            or packet.get("iid")
-            or packet.get("item_id")
-        )
+        for packet in packets:
+            packet_item_id = (
+                packet.get("ItemId")
+                or packet.get("itemId")
+                or packet.get("iid")
+                or packet.get("item_id")
+            )
 
-        if packet_item_id is None or str(packet_item_id) != str(item_id):
-            continue
-
-        latest_packets = packet.get("LatestPackets", {}) or {}
-
-        for packet_type in ("PhaseDay", "PhaseHour"):
-            phase_packet = latest_packets.get(packet_type)
-            if not phase_packet:
+            if packet_item_id is None or str(packet_item_id) != str(item_id):
                 continue
 
-            data = phase_packet.get("data", {}) or {}
+            latest_packets = packet.get("LatestPackets", {}) or {}
 
-            hwpi = data.get("hwpi")
-            hwpo = data.get("hwpo")
-            hwi = data.get("hwi")
-            hwo = data.get("hwo")
+            for packet_type in ("PhaseDay", "PhaseHour"):
+                phase_packet = latest_packets.get(packet_type)
+                if not phase_packet:
+                    continue
 
-            if hwpi is None and hwpo is None and hwi is None and hwo is None:
-                continue
+                data = phase_packet.get("data", {}) or {}
 
-            imported = 0.0
-            exported = 0.0
+                hwpi = data.get("hwpi")
+                hwpo = data.get("hwpo")
+                hwi = data.get("hwi")
+                hwo = data.get("hwo")
 
-            if isinstance(hwpi, list):
-                imported = sum(float(x) for x in hwpi[:3] if x is not None)
-            elif hwpi is not None:
-                imported = float(hwpi)
-            elif hwi is not None:
-                imported = float(hwi)
+                if hwpi is None and hwpo is None and hwi is None and hwo is None:
+                    continue
 
-            if isinstance(hwpo, list):
-                exported = sum(float(x) for x in hwpo[:3] if x is not None)
-            elif hwpo is not None:
-                exported = float(hwpo)
-            elif hwo is not None:
-                exported = float(hwo)
+                imported = 0.0
+                exported = 0.0
 
-            return {
-                "imported": imported,
-                "exported": exported,
-                "net": imported - exported,
-                "unit": "kWh",
-                "packet_type": packet_type,
-            }
+                if isinstance(hwpi, list):
+                    imported = sum(float(x) for x in hwpi[:3] if x is not None)
+                elif hwpi is not None:
+                    imported = float(hwpi)
+                elif hwi is not None:
+                    imported = float(hwi)
 
-    return {
-        "imported": None,
-        "exported": None,
-        "net": None,
-        "unit": "kWh",
-    }
+                if isinstance(hwpo, list):
+                    exported = sum(float(x) for x in hwpo[:3] if x is not None)
+                elif hwpo is not None:
+                    exported = float(hwpo)
+                elif hwo is not None:
+                    exported = float(hwo)
+
+                return {
+                    "imported": imported,
+                    "exported": exported,
+                    "net": imported - exported,
+                    "unit": "kWh",
+                    "packet_type": packet_type,
+                }
+
+        return {
+            "imported": None,
+            "exported": None,
+            "net": None,
+            "unit": "kWh",
+        }
 
     async def discover_items(self) -> list[dict[str, Any]]:
         """Discover available items/meters."""
