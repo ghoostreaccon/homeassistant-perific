@@ -55,21 +55,11 @@ async def async_setup_entry(
                 PerificCurrentSensor(coordinator, item_id, item_name, "l1"),
                 PerificCurrentSensor(coordinator, item_id, item_name, "l2"),
                 PerificCurrentSensor(coordinator, item_id, item_name, "l3"),
+                PerificEnergySensor(coordinator, item_id, item_name, "imported"),
+                PerificEnergySensor(coordinator, item_id, item_name, "exported"),
+                PerificEnergySensor(coordinator, item_id, item_name, "net"),
             ]
         )
-
-        energy_today = item_data.get("energy_today", {})
-        if any(
-            energy_today.get(key) is not None
-            for key in ("imported", "exported", "net")
-        ):
-            entities.extend(
-                [
-                    PerificEnergySensor(coordinator, item_id, item_name, "imported"),
-                    PerificEnergySensor(coordinator, item_id, item_name, "exported"),
-                    PerificEnergySensor(coordinator, item_id, item_name, "net"),
-                ]
-            )
 
     async_add_entities(entities)
 
@@ -104,7 +94,6 @@ class PerificSensorEntity(CoordinatorEntity, SensorEntity):
         """Return device information."""
         item_data = self.coordinator.data.get("items", {}).get(self._item_id, {})
         item_info = item_data.get("info", {})
-
         return {
             "identifiers": {(DOMAIN, self._item_id)},
             "name": self._item_name,
@@ -124,7 +113,6 @@ class PerificSensorEntity(CoordinatorEntity, SensorEntity):
             ATTR_ITEM_ID: self._item_id,
             ATTR_ITEM_NAME: self._item_name,
         }
-
         if power_data.get("timestamp") is not None:
             attrs[ATTR_TIMESTAMP] = power_data["timestamp"]
         if power_data.get("firmware") is not None:
@@ -157,7 +145,11 @@ class PerificPowerSensor(PerificSensorEntity):
 
         if power_data:
             power = power_data.get("power", {})
-            self._attr_native_value = power.get("total") if self._phase == "total" else power.get(self._phase)
+            self._attr_native_value = (
+                power.get("total")
+                if self._phase == "total"
+                else power.get(self._phase)
+            )
         else:
             self._attr_native_value = None
 
@@ -225,24 +217,32 @@ class PerificEnergySensor(PerificSensorEntity):
         super().__init__(coordinator, item_id, item_name, f"energy_{energy_type}")
         self._energy_type = energy_type
         self._attr_device_class = SensorDeviceClass.ENERGY
-        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_state_class = (
+            SensorStateClass.TOTAL
+            if energy_type == "net"
+            else SensorStateClass.TOTAL_INCREASING
+        )
+
+        self._update_native_value()
+
+    def _update_native_value(self) -> None:
+        """Update the native value from coordinator data."""
+        item_data = self.coordinator.data.get("items", {}).get(self._item_id, {})
+        energy_data = item_data.get("energy_today", {})
+        value = energy_data.get(self._energy_type)
+
+        if value is None:
+            self._attr_native_value = None
+            return
+
+        try:
+            self._attr_native_value = float(value)
+        except (TypeError, ValueError):
+            self._attr_native_value = None
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        item_data = self.coordinator.data.get("items", {}).get(self._item_id, {})
-
-        if self._energy_type in ["imported", "exported", "net"]:
-            energy_data = item_data.get("energy_today", {})
-            self._attr_native_value = energy_data.get(self._energy_type)
-        else:
-            power_data = item_data.get("power", {})
-            if self._energy_type == "imported_total":
-                self._attr_native_value = power_data.get("imported_energy")
-            elif self._energy_type == "exported_total":
-                self._attr_native_value = power_data.get("exported_energy")
-            else:
-                self._attr_native_value = None
-
+        self._update_native_value()
         super()._handle_coordinator_update()
