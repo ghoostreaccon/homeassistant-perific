@@ -55,6 +55,7 @@ async def async_setup_entry(
                 PerificCurrentSensor(coordinator, item_id, item_name, "l1"),
                 PerificCurrentSensor(coordinator, item_id, item_name, "l2"),
                 PerificCurrentSensor(coordinator, item_id, item_name, "l3"),
+
                 PerificEnergySensor(coordinator, item_id, item_name, "imported"),
                 PerificEnergySensor(coordinator, item_id, item_name, "exported"),
                 PerificEnergySensor(coordinator, item_id, item_name, "net"),
@@ -120,7 +121,11 @@ class PerificSensorEntity(CoordinatorEntity, SensorEntity):
         if power_data.get("signal_strength") is not None:
             attrs[ATTR_SIGNAL_STRENGTH] = power_data["signal_strength"]
 
-        packet_type = power_data.get("packet_type")
+        if self._sensor_type.startswith("energy_"):
+            packet_type = item_data.get("energy_today", {}).get("packet_type")
+        else:
+            packet_type = power_data.get("packet_type")
+
         if packet_type is not None:
             attrs["packet_type"] = packet_type
 
@@ -223,7 +228,6 @@ class PerificEnergySensor(PerificSensorEntity):
             if energy_type == "net"
             else SensorStateClass.TOTAL_INCREASING
         )
-
         self._update_native_value()
 
     def _update_native_value(self) -> None:
